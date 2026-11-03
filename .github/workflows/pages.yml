@@ -1,0 +1,92 @@
+name: Publish game
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prepare verified public release
+        id: release
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures, hashlib, json, os, pathlib, shutil, time, urllib.request
+          source = "https://111950a3.portal-game-814.pages.dev"
+          destination = pathlib.Path("_site")
+          destination.mkdir(exist_ok=True)
+          root_files = ["index.html", "favicon.svg", "precache.json", "sw.js", "_headers"]
+          bootstrapped = not pathlib.Path("precache.json").exists()
+          def download(url):
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(source + url, timeout=90) as response:
+                          return response.read()
+                  except Exception:
+                      if attempt == 2: raise
+                      time.sleep(2 ** attempt)
+          def check(data, expected):
+              assert len(data) == expected["bytes"], "Wrong file size"
+              assert hashlib.sha256(data).hexdigest() == expected["sha256"], "Wrong checksum"
+          if bootstrapped:
+              raw = download("/precache.json")
+              check(raw, {"bytes":15698,"sha256":"3e888b0e91df8ae3f797885d5cc7f789e7425a97b339ac8056dbed65f661c541"})
+              metadata = json.loads(raw)
+              assert metadata["version"] == "2ee90a07ba26002b1d0d"
+              (destination / "precache.json").write_bytes(raw)
+              entries = metadata["files"] + [dict(url="/" + name, **details) for name, details in {"index.html":{"bytes":3633,"sha256":"ef05b0dc65126be9ce043b41e63a45fa70810608a258ca10c56da1a42dfc588d"},"sw.js":{"bytes":20286,"sha256":"cc7e8dc01244c581d7d763e358aadd6b0866b9f2a2ce981d990f0daac19ccee8"},"_headers":{"bytes":238,"sha256":"95420b8d83aa2fb4901917c1ea553a83eed60385d04d0ef6541b621c9b6e6e60"}}.items()]
+              def receive(entry):
+                  relative = pathlib.PurePosixPath(entry["url"].lstrip("/"))
+                  assert ".." not in relative.parts
+                  content = download(entry["url"])
+                  check(content, entry)
+                  path = destination / str(relative)
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(content)
+              with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                  list(pool.map(receive, entries))
+              print("Imported and verified release", metadata["version"])
+          else:
+              for name in root_files:
+                  shutil.copy2(name, destination / name)
+              for name in ["assets", "audio", "data"]:
+                  shutil.copytree(name, destination / name, dirs_exist_ok=True)
+              metadata = json.loads((destination / "precache.json").read_text())
+          for entry in metadata["files"]:
+              check((destination / entry["url"].lstrip("/")).read_bytes(), entry)
+          (destination / ".nojekyll").touch()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("bootstrapped=" + str(bootstrapped).lower() + "\n")
+          print("Ready:", len(metadata["files"]), "verified game resources")
+          PY
+      - name: Save release files in this repository
+        if: steps.release.outputs.bootstrapped == 'true'
+        shell: bash
+        run: |
+          cp -a _site/assets _site/audio _site/data .
+          cp _site/index.html _site/favicon.svg _site/precache.json _site/sw.js _site/_headers _site/.nojekyll .
+          git add assets audio data index.html favicon.svg precache.json sw.js _headers .nojekyll
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "Import verified public game release"
+          git push origin HEAD:main
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload game
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - name: Publish
+        id: deployment
+        uses: actions/deploy-pages@v4
